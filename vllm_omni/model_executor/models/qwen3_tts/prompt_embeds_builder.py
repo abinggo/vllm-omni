@@ -1,3 +1,6 @@
+# SPDX-License-Identifier: Apache-2.0
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
+
 """Stand-alone builder for Qwen3-TTS AR talker prompt embeddings.
 
 Factors the prompt-construction logic out of
@@ -83,6 +86,37 @@ def build_instruct_text(instruct: str) -> str:
 # msgspec IPC ``additional_information`` round-trips (scalars, single-
 # element lists, ndarrays, tensors).
 # ---------------------------------------------------------------------------
+
+
+def resolve_x_vector_only(info_dict: dict) -> bool | None:
+    """Resolve whether a request runs Base voice-clone in x-vector-only mode.
+
+    Mirrors the resolution in :meth:`Qwen3TTSPromptEmbedsBuilder.build_prompt_embeds`
+    for the ``task_type == "Base"`` branch: the ``x_vector_only_mode`` flag, then
+    the ``voice_clone_prompt.icl_mode`` override when present.
+
+    Returns ``None`` when the mode does not apply (any non-Base task), so callers
+    can distinguish "in-context" from "not a voice-clone request at all".
+    """
+    task_type = first_value(info_dict.get("task_type"), "CustomVoice")
+    if task_type != "Base":
+        return None
+
+    xvec_only = bool((info_dict.get("x_vector_only_mode") or [False])[0])
+
+    raw = info_dict.get("voice_clone_prompt")
+    if isinstance(raw, list):
+        raw = raw[0] if raw else None
+    if isinstance(raw, list) and raw and isinstance(raw[0], dict):
+        raw = raw[0]
+    if isinstance(raw, dict) and "icl_mode" in raw:
+        icl_flag = raw.get("icl_mode")
+        if isinstance(icl_flag, list):
+            icl_flag = icl_flag[0] if icl_flag else None
+        if isinstance(icl_flag, bool):
+            xvec_only = not icl_flag
+
+    return xvec_only
 
 
 def first_value(value: object, default: object = None) -> object:
@@ -329,6 +363,7 @@ class Qwen3TTSPromptEmbedsBuilder:
         self._tts_pad_embed_buffer = tts_pad_embed
         self._encode_ref_audio_batch_fn = encode_ref_audio_batch
         self._speaker_cache = speaker_cache
+        self._embedding_dtype = torch.bfloat16
 
         self._text_tokenizer: Any | None = None
 
@@ -598,7 +633,7 @@ class Qwen3TTSPromptEmbedsBuilder:
         if isinstance(ref_code, torch.Tensor):
             entry["ref_code"] = ref_code.detach().to("cpu", dtype=torch.long).contiguous()
         if isinstance(ref_spk_embedding, torch.Tensor):
-            entry["ref_spk_embedding"] = ref_spk_embedding.detach().to("cpu", dtype=torch.bfloat16).reshape(-1)
+            entry["ref_spk_embedding"] = ref_spk_embedding.detach().to("cpu", dtype=self._embedding_dtype).reshape(-1)
         if not entry:
             return
         self._ref_audio_artifact_cache[cache_key] = entry
@@ -608,15 +643,20 @@ class Qwen3TTSPromptEmbedsBuilder:
 
     # -------------------- speaker encoder / codec encoder --------------------
 
+    # Some NPUs (310P, Ascend 950) do not support torch.stft; builders on
+    # such devices set this flag to compute the mel spectrogram on CPU.
+    _mel_spectrogram_on_cpu: bool = False
+
     def extract_speaker_embedding(self, wav: np.ndarray, sr: int) -> torch.Tensor:
         # vLLM workers do not automatically move arbitrary torch.nn.Modules to
         # CUDA. Ensure the speaker encoder is on the same device/dtype as the
         # main model before running it.
         dev = self._device()
+        dtype = self._embedding_dtype
         try:
             spk_param = next(self._speaker_encoder.parameters())
-            if spk_param.device != dev or spk_param.dtype != torch.bfloat16:
-                self._speaker_encoder.to(device=dev, dtype=torch.bfloat16)
+            if spk_param.device != dev or spk_param.dtype != dtype:
+                self._speaker_encoder.to(device=dev, dtype=dtype)
         except StopIteration:
             pass
 
@@ -630,7 +670,9 @@ class Qwen3TTSPromptEmbedsBuilder:
         # Follow official implementation: mel_spectrogram expects 24kHz. Move
         # the waveform first so STFT/mel computation stays on the model device
         # instead of materializing a CPU mel tensor and copying it per request.
-        wav_tensor = torch.from_numpy(wav).to(device=dev, dtype=torch.float32).unsqueeze(0)
+        # Devices without torch.stft set _mel_spectrogram_on_cpu instead.
+        mel_device = torch.device("cpu") if self._mel_spectrogram_on_cpu else dev
+        wav_tensor = torch.from_numpy(wav).to(device=mel_device, dtype=torch.float32).unsqueeze(0)
         mels = mel_spectrogram(
             wav_tensor,
             n_fft=1024,
@@ -641,8 +683,8 @@ class Qwen3TTSPromptEmbedsBuilder:
             fmin=0,
             fmax=12000,
         ).transpose(1, 2)
-        spk = self._speaker_encoder(mels.to(dtype=torch.bfloat16))[0]
-        return spk.to(dtype=torch.bfloat16)
+        spk = self._speaker_encoder(mels.to(device=dev, dtype=dtype))[0]
+        return spk.to(dtype=dtype)
 
     def encode_ref_audio_batch(
         self,
@@ -901,12 +943,12 @@ class Qwen3TTSPromptEmbedsBuilder:
 
             * ``talker_prompt``: ``[prompt_len, hidden]`` prefill embedding.
             * ``trailing_text_hidden``: ``[T, hidden]`` queue of text-side
-                embeddings consumed one-per-decode-step (streaming mode) or a
-                single pad row (non-streaming).
+                    embeddings consumed one-per-decode-step (streaming mode)
+                    or a single pad row (non-streaming).
             * ``ref_code_len``: Number of ref codec frames consumed when the
-                Base task ran in in-context mode (``None`` otherwise).
+                    Base task ran in in-context mode (``None`` otherwise).
             * ``ref_code``: The ``[T, Q]`` ref codec tensor used for ICL
-                (``None`` outside Base / ICL).
+                    (``None`` outside Base / ICL).
         """
         config = self._config
         talker_config = self._talker_config
@@ -1187,17 +1229,18 @@ class Qwen3TTSPromptEmbedsBuilder:
             # NOTE: Do NOT use _as_singleton here — the embedding may be a plain
             # float list (from API via msgspec IPC) that _as_singleton would
             # destructively unwrap to a single scalar.
+            speaker_dtype = self._embedding_dtype
             spk = None
             if voice_clone_prompt is not None:
                 spk = voice_clone_prompt.get("ref_spk_embedding")
             if isinstance(spk, torch.Tensor):
-                speaker_embed = spk.to(device=input_ids.device, dtype=torch.bfloat16).view(1, 1, -1)
+                speaker_embed = spk.to(device=input_ids.device, dtype=speaker_dtype).view(1, 1, -1)
             elif isinstance(spk, (list, np.ndarray)):
-                speaker_embed = torch.tensor(spk, dtype=torch.bfloat16, device=input_ids.device).view(1, 1, -1)
+                speaker_embed = torch.tensor(spk, dtype=speaker_dtype, device=input_ids.device).view(1, 1, -1)
             elif cached_artifacts is not None and isinstance(cached_artifacts.get("ref_spk_embedding"), torch.Tensor):
                 speaker_embed = (
                     cached_artifacts["ref_spk_embedding"]
-                    .to(device=input_ids.device, dtype=torch.bfloat16)
+                    .to(device=input_ids.device, dtype=speaker_dtype)
                     .view(1, 1, -1)
                 )
             elif artifact_only:
@@ -1205,6 +1248,15 @@ class Qwen3TTSPromptEmbedsBuilder:
             else:
                 wav_np, sr = _get_ref_audio()
                 speaker_embed = self.extract_speaker_embedding(wav_np, sr).view(1, 1, -1)
+
+            expected_speaker_dim = int(self._talker_config.hidden_size)
+            actual_speaker_dim = int(speaker_embed.shape[-1])
+            if actual_speaker_dim != expected_speaker_dim:
+                raise ValueError(
+                    "Qwen3-TTS speaker embedding dimension mismatch: "
+                    f"got {actual_speaker_dim}, but the talker requires {expected_speaker_dim}. "
+                    "Use a matching Base checkpoint or a compatible precomputed speaker embedding."
+                )
 
             # Cache miss: store extraction result in the speaker cache.
             if _speaker_cache_key is not None and speaker_embed is not None and self._speaker_cache is not None:
@@ -1317,9 +1369,7 @@ class Qwen3TTSPromptEmbedsBuilder:
             # Keep it at least 1D; embedding on a 0-d tensor can return 1D.
             spk_tensor = torch.tensor([spk_id], device=input_ids.device, dtype=torch.long)
             spk_embed = codec_embed(spk_tensor)
-            if spk_embed.ndim == 1:
-                spk_embed = spk_embed.view(1, 1, -1)
-            elif spk_embed.ndim == 2:
+            if spk_embed.ndim in (1, 2):
                 spk_embed = spk_embed.view(1, 1, -1)
             speaker_embed = spk_embed
             codec_input = torch.cat([codec_input_0, speaker_embed, codec_input_1], dim=1)
@@ -1520,9 +1570,7 @@ class Qwen3TTSPromptEmbedsBuilder:
 
                 ref_code_len: int | None = None
                 if isinstance(ref_code, list):
-                    if ref_code and isinstance(ref_code[0], list):
-                        ref_code_len = len(ref_code)
-                    elif ref_code:
+                    if ref_code:
                         ref_code_len = len(ref_code)
                 elif hasattr(ref_code, "shape"):
                     try:

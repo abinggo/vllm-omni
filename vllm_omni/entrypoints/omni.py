@@ -25,16 +25,25 @@ logger = init_logger(__name__)
 class Omni(OmniBase):
     """Synchronous entrypoint for offline generation."""
 
-    def _set_final_only_for_llm_stages(
+    def _maybe_force_final_only_for_llm_stages(
         self,
         sampling_params_list: Sequence[OmniSamplingParams],
     ) -> list[OmniSamplingParams]:
-        """Return per-stage params with LLM stages forced to FINAL_ONLY."""
+        """Return per-stage params with LLM stages forced to FINAL_ONLY.
+
+        The caller may explicitly request ``output_kind = DELTA`` on a stage to
+        opt into streaming; such stages are left alone.  All other LLM stages
+        are forced to FINAL_ONLY.
+        """
         effective_params: list[OmniSamplingParams] = []
         for stage_id, params in enumerate(sampling_params_list):
             sp = copy.deepcopy(params)
             stage_meta = self.engine.get_stage_metadata(stage_id)
-            if stage_meta.stage_type != "diffusion" and hasattr(sp, "output_kind"):
+            if (
+                stage_meta.stage_type != "diffusion"
+                and hasattr(sp, "output_kind")
+                and sp.output_kind != RequestOutputKind.DELTA
+            ):
                 sp.output_kind = RequestOutputKind.FINAL_ONLY
             effective_params.append(sp)
         return effective_params
@@ -103,7 +112,7 @@ class Omni(OmniBase):
         use_tqdm: bool | Callable[..., tqdm] = True,
     ) -> Generator[OmniRequestOutput, None, None]:
         try:
-            sampling_params_list = self._set_final_only_for_llm_stages(sampling_params_list)
+            sampling_params_list = self._maybe_force_final_only_for_llm_stages(sampling_params_list)
 
             if isinstance(prompts, str) or not isinstance(prompts, Sequence):
                 request_prompts: list[OmniPromptType] = [prompts]
@@ -191,6 +200,8 @@ class Omni(OmniBase):
                     self._log_summary_and_cleanup(req_id)
         except Exception:
             if "active_reqs" in locals() and active_reqs:
+                for req_id in active_reqs:
+                    self._record_request_failure_once(req_id, reason="stage_error")
                 self.abort(list(active_reqs))
             raise
         finally:
@@ -201,6 +212,7 @@ class Omni(OmniBase):
         request_ids = [request_id] if isinstance(request_id, str) else list(request_id)
         self.engine.abort(request_ids)
         for req_id in request_ids:
+            self._record_request_failure_once(req_id, reason="client_abort")
             self.request_states.pop(req_id, None)
         if self.log_stats:
             logger.info("[Omni] Aborted request(s) %s", ",".join(request_ids))

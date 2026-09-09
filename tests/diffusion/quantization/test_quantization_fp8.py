@@ -6,13 +6,11 @@ End-to-end tests for the unified quantization framework (PR #1764).
 Validates FP8 quantization works correctly for all supported model types:
   - Single-stage diffusion models (FLUX.1-dev, Qwen-Image, Z-Image-Turbo)
   - Multi-stage models (BAGEL: LLM + Diffusion)
-  - MoT gen-only models (SenseNova-U1: gen-path FP8, und-path BF16)
 
 Tests verify:
   1. FP8 quantization produces valid images
   2. Memory usage is lower than BF16 baseline
   3. Multi-stage models only quantize the diffusion stage (not the LLM stage)
-  4. MoT models only quantize gen-path layers (mot_gen)
 
 Usage:
     # Run all FP8 quantization tests
@@ -90,8 +88,8 @@ def _generate_single_stage_image(
         if hasattr(first_output, "images") and first_output.images:
             images = first_output.images
         else:
-            assert hasattr(first_output, "request_output") and first_output.request_output
-            request_output = first_output.request_output
+            assert isinstance(first_output, OmniRequestOutput) and first_output
+            request_output = first_output
             if isinstance(request_output, list):
                 req_out = request_output[0]
             else:
@@ -149,10 +147,10 @@ def _generate_single_stage_video(
 
         first = outputs[0]
 
-        # Unwrap pipeline-style outputs (multi-stage / OmniRequestOutput.request_output).
+        # Unwrap pipeline-style outputs (multi-stage / OmniRequestOutput).
         frames: Any = None
-        if hasattr(first, "request_output") and isinstance(first.request_output, list):
-            inner = first.request_output[0]
+        if isinstance(first, OmniRequestOutput) and isinstance(first, list):
+            inner = first[0]
             if isinstance(inner, OmniRequestOutput) and inner.images:
                 frames = inner.images[0]
         if frames is None and hasattr(first, "images") and first.images:
@@ -191,7 +189,7 @@ def _generate_single_stage_video(
 
 
 def _generate_bagel_image(
-    quantization_config: str | None = None,
+    diffusion_quantization_config: str | None = None,
     num_inference_steps: int = 15,
 ) -> tuple[Any, float]:
     """Generate an image with BAGEL (multi-stage: LLM + Diffusion).
@@ -201,11 +199,11 @@ def _generate_bagel_image(
     config_path = get_deploy_config_path("ci/bagel.yaml")
     omni_kwargs: dict[str, Any] = {
         "model": "ByteDance-Seed/BAGEL-7B-MoT",
-        "stage_configs_path": config_path,
+        "deploy_config": config_path,
         "stage_init_timeout": 300,
     }
-    if quantization_config:
-        omni_kwargs["quantization_config"] = quantization_config
+    if diffusion_quantization_config:
+        omni_kwargs["diffusion_quantization_config"] = diffusion_quantization_config
 
     model_name = omni_kwargs.pop("model")
     with OmniRunner(model_name, **omni_kwargs) as runner:
@@ -236,8 +234,8 @@ def _generate_bagel_image(
             if images := getattr(req_output, "images", None):
                 generated_image = images[0]
                 break
-            if hasattr(req_output, "request_output") and req_output.request_output:
-                stage_outputs = req_output.request_output
+            if isinstance(req_output, OmniRequestOutput) and req_output:
+                stage_outputs = req_output
                 if not isinstance(stage_outputs, list):
                     stage_outputs = [stage_outputs]
                 for stage_out in stage_outputs:
@@ -252,8 +250,8 @@ def _generate_bagel_image(
 
         # Check LLM stage output — should have finish_reason=stop (not length)
         for req_output in omni_outputs:
-            if hasattr(req_output, "request_output") and req_output.request_output:
-                stage_outputs = req_output.request_output
+            if isinstance(req_output, OmniRequestOutput) and req_output:
+                stage_outputs = req_output
                 if not isinstance(stage_outputs, list):
                     stage_outputs = [stage_outputs]
                 for stage_out in stage_outputs:
@@ -382,21 +380,21 @@ def test_single_stage_ltx2_fp8_uses_less_memory():
 
 @hardware_test(res={"cuda": "H100"})
 def test_bagel_fp8_generates_image():
-    """BAGEL with FP8 quantization_config generates a valid image.
+    """BAGEL with diffusion-stage FP8 generates a valid image.
 
     FP8 should only apply to the diffusion stage (Stage-1), not the
     LLM stage (Stage-0). We verify this by checking:
       1. Image is generated successfully
       2. LLM stage finish_reason is 'stop' (not 'length' from garbled output)
     """
-    image, _ = _generate_bagel_image(quantization_config="fp8")
+    image, _ = _generate_bagel_image(diffusion_quantization_config="fp8")
     image.save("test_bagel_fp8.png")
 
 
 @hardware_test(res={"cuda": "H100"})
 def test_bagel_bf16_generates_image():
     """BAGEL without quantization generates a valid image (baseline)."""
-    image, _ = _generate_bagel_image(quantization_config=None)
+    image, _ = _generate_bagel_image(diffusion_quantization_config=None)
     image.save("test_bagel_bf16.png")
 
 
@@ -438,92 +436,3 @@ def test_single_stage_quantization_config_key():
         quantization_config="fp8",
     )
     assert len(images) >= 1
-
-
-# ─── SenseNova-U1 gen-only FP8 tests ─────────────────────────────────────────
-
-_SENSENOVA_MODEL = "SenseNova/SenseNova-U1-8B-MoT"
-
-
-def _generate_sensenova_u1_image(
-    quantization_config: str | None = None,
-    num_inference_steps: int = 20,
-) -> tuple[Any, float]:
-    """Generate an image with SenseNova-U1 (single-stage MoT, gen-only FP8).
-
-    Returns (generated_image, peak_memory_gib).
-    """
-    omni_kwargs: dict[str, Any] = {}
-    if quantization_config:
-        omni_kwargs["quantization_config"] = quantization_config
-
-    with OmniRunner(_SENSENOVA_MODEL, **omni_kwargs) as runner:
-        torch.accelerator.reset_peak_memory_stats()
-
-        sampling_params = OmniDiffusionSamplingParams(
-            height=1024,
-            width=1024,
-            seed=42,
-            num_inference_steps=num_inference_steps,
-            extra_args={
-                "cfg_scale": 4.0,
-                "cfg_norm": "none",
-                "timestep_shift": 3.0,
-            },
-        )
-        omni_outputs = list(
-            runner.omni.generate(
-                prompts={"prompt": "A cat sitting on a windowsill", "modalities": ["image"]},
-                sampling_params_list=sampling_params,
-            )
-        )
-
-        peak_mem = torch.accelerator.max_memory_allocated() / (1024**3)
-
-        generated_image = None
-        for req_output in omni_outputs:
-            if images := getattr(req_output, "images", None):
-                generated_image = images[0]
-                break
-
-        assert generated_image is not None, "No images generated from SenseNova-U1"
-        assert generated_image.size == (1024, 1024), f"Expected 1024x1024, got {generated_image.size}"
-
-        return generated_image, peak_mem
-
-
-@hardware_test(res={"cuda": "H100"})
-def test_sensenova_u1_fp8_generates_image():
-    """SenseNova-U1 with gen-only FP8 generates a valid image.
-
-    FP8 is applied only to gen-path (mot_gen) layers; understanding-path
-    layers stay in BF16.
-    """
-    image, _ = _generate_sensenova_u1_image(quantization_config="fp8")
-    image.save("test_sensenova_u1_fp8.png")
-
-
-@hardware_test(res={"cuda": "H100"})
-def test_sensenova_u1_bf16_generates_image():
-    """SenseNova-U1 without quantization generates a valid image (baseline)."""
-    image, _ = _generate_sensenova_u1_image(quantization_config=None)
-    image.save("test_sensenova_u1_bf16.png")
-
-
-@hardware_test(res={"cuda": "H100"})
-def test_sensenova_u1_fp8_uses_less_memory():
-    """Gen-only FP8 should use less peak memory than BF16 for SenseNova-U1."""
-    _, mem_bf16 = _generate_sensenova_u1_image(
-        quantization_config=None,
-        num_inference_steps=10,
-    )
-    torch.accelerator.empty_cache()
-
-    _, mem_fp8 = _generate_sensenova_u1_image(
-        quantization_config="fp8",
-        num_inference_steps=10,
-    )
-
-    print(f"SenseNova-U1 BF16 peak memory: {mem_bf16:.2f} GiB")
-    print(f"SenseNova-U1 FP8  peak memory: {mem_fp8:.2f} GiB")
-    assert mem_fp8 < mem_bf16, f"FP8 ({mem_fp8:.2f} GiB) should use less memory than BF16 ({mem_bf16:.2f} GiB)"

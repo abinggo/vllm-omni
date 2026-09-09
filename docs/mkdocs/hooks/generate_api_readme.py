@@ -22,6 +22,13 @@ CATEGORIES = {
         "name": "Entry Points",
         "description": "Main entry points for vLLM-Omni inference and serving.",
     },
+    "clients": {
+        "name": "Clients",
+        "description": (
+            "Client libraries that talk to a running vLLM-Omni server "
+            "(the full-duplex Realtime client and its per-model session presets)."
+        ),
+    },
     "inputs": {
         "name": "Inputs",
         "description": "Input data structures for multi-modal inputs.",
@@ -144,6 +151,7 @@ def scan_package(package_name: str = "vllm_omni") -> dict[str, list[str]]:
                 "vllm_omni.entrypoints.async_diffusion",
                 "vllm_omni.entrypoints.openai",
                 "vllm_omni.model_executor.models.voxtral_tts.configuration_voxtral_tts",
+                "vllm_omni.experimental",  # optional serving deps not installed in docs build
             ]
             if any(module_path.startswith(prefix) for prefix in excluded_prefixes):
                 continue

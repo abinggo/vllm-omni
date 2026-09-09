@@ -1,3 +1,6 @@
+# SPDX-License-Identifier: Apache-2.0
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
+
 import asyncio
 import json
 import threading
@@ -40,7 +43,9 @@ def _json_unpack(data):
 
 
 def _engine_with_policy_config(policy_config=None):
-    od_config = SimpleNamespace(model_config={"policy_server_config": policy_config or TEST_POLICY_SERVER_CONFIG})
+    if policy_config is None:
+        policy_config = TEST_POLICY_SERVER_CONFIG
+    od_config = SimpleNamespace(model_config={"policy_server_config": policy_config})
     return SimpleNamespace(get_diffusion_od_config=lambda: od_config)
 
 
@@ -172,6 +177,15 @@ def test_create_policy_server_returns_none_without_policy_config():
     assert serving is None
 
 
+def test_policy_server_config_allows_explicit_empty_config():
+    serving = openpi_serving.ServingRealtimeRobotOpenPI(
+        engine_client=_engine_with_policy_config(policy_config={}),
+        model_name="nvidia/Cosmos3-Nano-Policy-DROID",
+    )
+
+    assert serving.policy_server_config.to_dict() == {}
+
+
 def test_policy_server_config_reads_engine_model_config():
     policy_config = {"custom_model_key": "custom-value"}
     engine_client = SimpleNamespace(model_config=SimpleNamespace(policy_server_config=policy_config))
@@ -205,6 +219,18 @@ def test_build_request_uses_unique_engine_request_id_per_inference():
     assert request_a.request_id == "robot-session-a-0"
     assert request_b.request_id == "robot-session-a-1"
     assert request_a.request_id != request_b.request_id
+
+
+def test_build_request_forwards_seed_to_sampling_params():
+    """``seed`` in the inference message is the engine-level seed; omitted, the request auto-seeds."""
+    serving = openpi_serving.ServingRealtimeRobotOpenPI(engine_client=_engine_with_policy_config())
+
+    seeded = serving._build_request({"prompt": "pick up the object", "seed": 42}, session_id="s", reset=True)
+    unseeded = serving._build_request({"prompt": "pick up the object"}, session_id="s", reset=False)
+
+    assert seeded.sampling_params.seed == 42
+    assert "seed" not in seeded.sampling_params.extra_args["robot_obs"]
+    assert isinstance(unseeded.sampling_params.seed, int)
 
 
 def test_infer_keeps_session_state_but_uses_unique_engine_request_ids():

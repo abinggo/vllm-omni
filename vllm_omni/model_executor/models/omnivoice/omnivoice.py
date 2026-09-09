@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
-# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
 """
 OmniVoice model for vLLM-Omni two-stage TTS pipeline.
 
@@ -38,6 +38,7 @@ from vllm.multimodal.processing import (
 from vllm.sequence import IntermediateTensors
 
 from vllm_omni.model_executor.models.output_templates import OmniOutput
+from vllm_omni.platforms import current_omni_platform
 from vllm_omni.transformers_utils.configs.omnivoice import OmniVoiceConfig
 
 logger = init_logger(__name__)
@@ -379,13 +380,12 @@ class OmniVoiceModel(
         target_ids = torch.full((num_codebooks, target_len), mask_id, dtype=torch.long, device=device)
 
         # Conditional: [text] [ref_audio?] [target_mask]
+        cond_audio_start = text_ids.shape[1]
         if ref_audio_tokens is not None:
             ref_tokens = ref_audio_tokens.to(device)  # [8, T_ref]
             cond_ids = torch.cat([text_ids, ref_tokens, target_ids], dim=1)
-            cond_audio_start = text_ids.shape[1]
         else:
             cond_ids = torch.cat([text_ids, target_ids], dim=1)
-            cond_audio_start = text_ids.shape[1]
 
         cond_len = cond_ids.shape[1]
 
@@ -487,15 +487,15 @@ class OmniVoiceModel(
         if os.path.isdir(model_dir):
             return model_dir
         # HF hub model ID — resolve to local cache
-        from huggingface_hub import snapshot_download
+        from vllm_omni.transformers_utils.repo_utils import hf_api
 
-        return snapshot_download(model_dir)
+        return hf_api().snapshot_download(model_dir)
 
     def load_weights(self, weights: Iterable[tuple[str, torch.Tensor]]) -> set[str]:
         try:
             device = next(self.parameters()).device
         except StopIteration:
-            device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+            device = current_omni_platform.get_torch_device()
 
         model_dir = self._resolve_model_dir()
 

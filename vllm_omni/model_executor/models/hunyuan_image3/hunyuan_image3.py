@@ -29,7 +29,7 @@ from vllm.distributed import (
 )
 from vllm.inputs import MultiModalDataDict
 from vllm.logger import init_logger
-from vllm.model_executor.layers.fused_moe import FusedMoE as SharedFusedMoE
+from vllm.model_executor.layers.fused_moe import FusedMoEFactory as SharedFusedMoE
 from vllm.model_executor.layers.fused_moe import fused_moe_make_expert_params_mapping
 from vllm.model_executor.layers.linear import (
     ColumnParallelLinear,
@@ -68,7 +68,6 @@ from vllm.model_executor.models.utils import (
     maybe_prefix,
 )
 from vllm.multimodal import MULTIMODAL_REGISTRY
-from vllm.multimodal.image import rgba_to_rgb
 from vllm.multimodal.inputs import (
     MultiModalFeatureSpec,
     MultiModalFieldConfig,
@@ -129,25 +128,29 @@ class HunyuanModel(HunYuanModel):
         v = v.reshape(-1, hidden_size)
         return torch.concat((q, k, v))
 
-    def get_expert_mapping(self) -> tuple[list[tuple[str, str, int, str]], dict[str, tuple[str, int, int]]]:
-        if _is_moe(self.config):
-            # Params for weights, fp8 weight scales, fp8 activation scales
-            # (param_name, weight_name, expert_id, shard_id)
-            fused_moe_expert_mapping = fused_moe_make_expert_params_mapping(
-                model=self,
-                ckpt_gate_proj_name="gate_proj",
-                ckpt_down_proj_name="down_proj",
-                ckpt_up_proj_name="up_proj",
-                num_experts=self.config.num_experts,
-                num_redundant_experts=self.num_redundant_experts,
-            )
-            expert_weights_remapping = {
-                "gate_proj": ("gate_and_up_proj", 1, 2),
-                "up_proj": ("gate_and_up_proj", 0, 2),
-            }
-            return fused_moe_expert_mapping, expert_weights_remapping
-        else:
-            return [], {}
+    def get_expert_mapping(self) -> list[tuple[str, str, int, str]]:
+        if not _is_moe(self.config):
+            return []
+
+        # Params for weights, fp8 weight scales, fp8 activation scales
+        # (param_name, weight_name, expert_id, shard_id)
+        return fused_moe_make_expert_params_mapping(
+            model=self,
+            ckpt_gate_proj_name="gate_proj",
+            ckpt_down_proj_name="down_proj",
+            ckpt_up_proj_name="up_proj",
+            num_experts=self.config.num_experts,
+            num_redundant_experts=self.num_redundant_experts,
+        )
+
+    def _get_expert_weights_remapping(self) -> dict[str, tuple[str, int, int]]:
+        """Return the vLLM-Omni-local remapping for Hunyuan checkpoint weights."""
+        if not _is_moe(self.config):
+            return {}
+        return {
+            "gate_proj": ("gate_and_up_proj", 1, 2),
+            "up_proj": ("gate_and_up_proj", 0, 2),
+        }
 
     def load_weights(self, weights: Iterable[tuple[str, torch.Tensor]]):
         cla_factor = _get_cla_factor(self.config)
@@ -175,7 +178,8 @@ class HunyuanModel(HunYuanModel):
 
         params_dict = dict(self.named_parameters())
         loaded_params: set[str] = set()
-        expert_params_mapping, expert_weights_remapping = self.get_expert_mapping()
+        expert_params_mapping = self.get_expert_mapping()
+        expert_weights_remapping = self._get_expert_weights_remapping()
 
         # List of unexpected keywords in weight names
         unexpected_keywords = [
@@ -223,14 +227,8 @@ class HunyuanModel(HunYuanModel):
             if self.config.tie_word_embeddings and "lm_head.weight" in name:
                 continue
 
-            if self.quant_config is not None and (scale_name := self.quant_config.get_cache_scale(name)):
-                # Loading kv cache scales for compressed-tensors quantization
-                param = params_dict[scale_name]
-                weight_loader = getattr(param, "weight_loader", default_weight_loader)
-                loaded_weight = loaded_weight[0]
-                weight_loader(param, loaded_weight)
-                continue
-
+            # KV-cache scales are renamed to .attn.{k,v,q}_scale by the
+            # quant_config mapper in the outer AutoWeightsLoader.
             is_found = False
             for param_name, weight_name, shard_id in stacked_params_mapping:
                 if weight_name not in name:
@@ -889,8 +887,8 @@ class HunyuanImage3Processor:
         for image in images:
             current_info = {}
 
-            if self.hf_config.vit["num_channels"] == 3 and image.mode == "RGBA":
-                image = rgba_to_rgb(image, (255, 255, 255))
+            if self.hf_config.vit["num_channels"] == 3 and image.mode != "RGB":
+                image = image.convert("RGB")
 
             # VIT processing
             vit_pixel_values = self.vision_encoder_processor(image)
@@ -1043,6 +1041,9 @@ class HunyuanImage3MultiModalProcessor(BaseMultiModalProcessor[HunyuanImage3Proc
         images = mm_data.get("images", [])
         logger.debug(f"process image count: {len(images)}")
         batch_feature = image_processor(prompt, images, **tok_kwargs)
+        vae_generator_seed = mm_kwargs.get("vae_generator_seed")
+        if vae_generator_seed is not None and images:
+            batch_feature["vae_generator_seed"] = torch.full((len(images),), int(vae_generator_seed), dtype=torch.long)
         return batch_feature
 
     def _hf_processor_applies_updates(
@@ -1080,6 +1081,8 @@ class HunyuanImage3MultiModalProcessor(BaseMultiModalProcessor[HunyuanImage3Proc
             config["base_size"] = MultiModalFieldConfig.batched("image")
         if "ratio_index" in hf_inputs:
             config["ratio_index"] = MultiModalFieldConfig.batched("image")
+        if "vae_generator_seed" in hf_inputs:
+            config["vae_generator_seed"] = MultiModalFieldConfig.batched("image")
         return config
 
     def _get_prompt_updates(
@@ -1452,6 +1455,7 @@ class HunyuanImage3ForConditionalGeneration(nn.Module, SupportsMultiModal, Suppo
     HunyuanImage3Inputs: TypeAlias = HunyuanImage3PixelInputs
 
     prefer_model_sampler = True
+    logitsprocs_need_output_token_ids = True
 
     # Siglip2 ViT supports data-parallel encoding (mm_encoder_tp_mode="data"):
     # weights are replicated and the image batch is sharded across TP ranks.
@@ -1732,6 +1736,7 @@ class HunyuanImage3ForConditionalGeneration(nn.Module, SupportsMultiModal, Suppo
         # we reconstruct per-image shapes from vae_token_grid_hw below.
         kwargs.pop("vae_pixel_size", None)
         vae_token_grid_hw = kwargs.pop("vae_token_grid_hw", None)
+        vae_generator_seed = kwargs.pop("vae_generator_seed", None)
 
         if vit_pixel_values is None or vae_pixel_values is None:
             return None
@@ -1771,6 +1776,7 @@ class HunyuanImage3ForConditionalGeneration(nn.Module, SupportsMultiModal, Suppo
                 "vit_spatial_shapes": vit_spatial_shapes,
                 "vae_pixel_values": vae_image_list,
                 "vae_token_grid_hw": vae_token_grid_hw,
+                "vae_generator_seed": vae_generator_seed,
             },
         )
 
@@ -1778,6 +1784,7 @@ class HunyuanImage3ForConditionalGeneration(nn.Module, SupportsMultiModal, Suppo
         self,
         images: torch.Tensor,
         cfg_factor: int = 1,
+        generator: torch.Generator | None = None,
     ) -> tuple[tuple[torch.Tensor, torch.Tensor], ...]:
         """
         Encode images through VAE encoder.
@@ -1797,11 +1804,7 @@ class HunyuanImage3ForConditionalGeneration(nn.Module, SupportsMultiModal, Suppo
             images = images.to(dtype=self.vae.dtype)
 
         vae_encode_result = self.vae.encode(images)
-        # Match HunyuanImage-3's cond encode path: sample the posterior, but
-        # use a fixed generator so online requests do not consume the global
-        # RNG and drift across a long-running server.
-        _cond_vae_gen = torch.Generator(device=images.device).manual_seed(0)
-        latents = vae_encode_result.latent_dist.sample(_cond_vae_gen)
+        latents = vae_encode_result.latent_dist.sample(generator)
 
         # Apply shift and scaling factors if present
         if hasattr(config, "shift_factor") and config.shift_factor:
@@ -1933,6 +1936,12 @@ class HunyuanImage3ForConditionalGeneration(nn.Module, SupportsMultiModal, Suppo
         vit_pixel_attention_mask = pixel_values["vit_pixel_attention_mask"]
         vit_spatial_shapes = pixel_values["vit_spatial_shapes"]
         vae_pixel_values = pixel_values["vae_pixel_values"]
+        vae_generator_seed = pixel_values.get("vae_generator_seed")
+        vae_generator = None
+        if vae_generator_seed is not None and vae_generator_seed.numel() > 0:
+            vae_generator = torch.Generator(device=vae_pixel_values[0].device).manual_seed(
+                int(vae_generator_seed.reshape(-1)[0].item())
+            )
 
         # Perform ViT encoding
         vit_embeddings = self._vit_encode(vit_pixel_values, vit_pixel_attention_mask, vit_spatial_shapes)
@@ -1941,7 +1950,7 @@ class HunyuanImage3ForConditionalGeneration(nn.Module, SupportsMultiModal, Suppo
         # `reso_group` bucket so shapes are ragged across the image-batch dim.
         vae_token_embeddings = []
         for vae_image_i in vae_pixel_values:
-            t_i, latents_i = self._vae_encode(vae_image_i.unsqueeze(0), vae_cfg_factor)
+            t_i, latents_i = self._vae_encode(vae_image_i.unsqueeze(0), vae_cfg_factor, generator=vae_generator)
             t_emb = self.time_embed(t_i[0])
             vae_tokens, _, _ = self.patch_embed(latents_i, t_emb)
             vae_token_embeddings.append(vae_tokens)
@@ -1998,10 +2007,9 @@ class HunyuanImage3ForConditionalGeneration(nn.Module, SupportsMultiModal, Suppo
         # the bidirectional MM region and biased AR ratio prediction toward
         # the first image's bucket.
         timestep_mask = input_ids == self._timestep_token_id
-        n_timestep = int(timestep_mask.sum().item())
-        if n_timestep > 0:
-            timestep_input = torch.zeros((n_timestep,), device=inputs_embeds.device, dtype=inputs_embeds.dtype)
-            inputs_embeds[timestep_mask] = self._timestep_encode(timestep_input)
+        timestep_input = torch.zeros((), device=inputs_embeds.device, dtype=inputs_embeds.dtype)
+        timestep_embed = self._timestep_encode(timestep_input).to(inputs_embeds.dtype)
+        inputs_embeds = torch.where(timestep_mask.unsqueeze(-1), timestep_embed, inputs_embeds)
 
         if multimodal_embeddings is None or len(multimodal_embeddings) == 0:
             return inputs_embeds

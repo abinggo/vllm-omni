@@ -1,3 +1,6 @@
+# SPDX-License-Identifier: Apache-2.0
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
+
 from collections.abc import Iterable, Mapping, Sequence
 from math import isqrt
 from typing import Any
@@ -122,9 +125,9 @@ class OmniBagelProcessingInfo(BaseProcessingInfo):
             if p.is_dir():
                 index_path = p / "model.safetensors.index.json"
             else:
-                from huggingface_hub import hf_hub_download
+                from vllm_omni.transformers_utils.repo_utils import hf_api
 
-                index_path = Path(hf_hub_download(model_name, "model.safetensors.index.json"))
+                index_path = Path(hf_api().hf_hub_download(model_name, "model.safetensors.index.json"))
 
             if not index_path.exists():
                 return
@@ -587,9 +590,9 @@ class OmniBagelForConditionalGeneration(BagelForConditionalGeneration):
         input_ids: torch.Tensor | None,
         positions: torch.Tensor | None,
         inputs_embeds: torch.Tensor | None,
-        req_ids: list[str],
-        num_computed_tokens: list[int],
-        num_scheduled_tokens: list[int],
+        req_ids: Sequence[str],
+        num_computed_tokens: Sequence[int],
+        num_scheduled_tokens: Sequence[int],
         input_ids_buffer: torch.Tensor | None = None,
     ) -> tuple[torch.Tensor | None, torch.Tensor | None]:
         """Restore input_ids so _adjust_positions_for_img2img can locate
@@ -599,7 +602,7 @@ class OmniBagelForConditionalGeneration(BagelForConditionalGeneration):
             input_ids = input_ids_buffer
         return input_ids, positions
 
-    def flush_pending_metadata(self, req_ids: list[str]) -> None:
+    def flush_pending_metadata(self, req_ids: Sequence[str]) -> None:
         """Map pending metadata (batch order) to req_ids after forward().
 
         Guard: if a request already has metadata with ``image_shape``

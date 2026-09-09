@@ -1,3 +1,6 @@
+# SPDX-License-Identifier: Apache-2.0
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
+
 """
 Comprehensive tests of diffusion features that are available in online serving mode.
 
@@ -19,7 +22,7 @@ import pytest
 
 from tests.helpers.mark import hardware_marks
 from tests.helpers.media import generate_synthetic_image
-from tests.helpers.runtime import OmniServer, OmniServerParams, OpenAIClientHandler
+from tests.helpers.runtime import OmniServer, OmniServerParams, OnlineOmniClient
 
 pytestmark = [pytest.mark.diffusion, pytest.mark.full_model]
 
@@ -85,7 +88,22 @@ def _get_wan22_feature_cases():
     """
     cases = []
 
-    # ---- CUDA cases (unchanged) ----
+    # ---- CUDA cases ----
+
+    # Single-card: CPU offload (applies to all models)
+    for model_path, model_key in WAN22_MODELS:
+        cases.append(
+            pytest.param(
+                OmniServerParams(
+                    model=model_path,
+                    server_args=["--enable-cpu-offload"],
+                ),
+                id=f"{model_key}_cpu_offload",
+                marks=CUDA_SINGLE_CARD_MARKS,
+            )
+        )
+
+    # Single-card: Cache-DiT (applies to all models)
     for model_path, model_key in WAN22_MODELS:
         cases.append(
             pytest.param(
@@ -125,7 +143,7 @@ def _get_wan22_feature_cases():
 )
 def test_wan22_diffusion_features(
     omni_server: OmniServer,
-    openai_client: OpenAIClientHandler,
+    online_client: OnlineOmniClient,
 ):
     model_path = omni_server.model
     is_i2v_or_ti2v = any(kw in model_path for kw in ["I2V", "TI2V"])
@@ -161,4 +179,4 @@ def test_wan22_diffusion_features(
     if is_i2v_or_ti2v:
         request_config["image_reference"] = f"data:image/jpeg;base64,{generate_synthetic_image(512, 512)['base64']}"
 
-    openai_client.send_video_diffusion_request(request_config)
+    online_client.send_video_diffusion_request(request_config)
